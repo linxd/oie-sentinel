@@ -1,8 +1,8 @@
 {
     "schemaVersion": 1,
     "id": "sentinel",
-    "name": "OIE Sentinel",
-    "description": "Zabbix-inspired monitoring and alerting for channel activity: inactivity, low-volume, anomaly, connection-status, error-rate and queue-depth monitors, with email, channel, SNS and webhook alert delivery, storm control, escalation chains, and a dashboard embedded in the OIE Web Administrator.",
+    "name": "OIE 哨兵",
+    "description": "借鉴 Zabbix 的通道活动监控与告警：不活动、低流量、异常、连接状态、错误率和队列深度监控器，支持邮件、通道、SNS 和 Webhook 告警投递，风暴控制、升级链，以及嵌入 OIE Web 管理员的仪表盘。",
     "type": "plugin",
     "ui": ["web"],
     "version": "1.1.2",

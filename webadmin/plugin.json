@@ -1,9 +1,9 @@
 {
     "id": "sentinel",
-    "name": "OIE Sentinel",
+    "name": "OIE 哨兵",
     "version": "1.1.2",
     "author": "Chris Gibson",
-    "description": "Zabbix-inspired monitoring and alerting for channel activity.",
+    "description": "借鉴 Zabbix 的通道活动监控与告警。",
     "enabled": true,
     "oie": { "apiMin": "4.6" },
     "client": { "entry": "web/plugin.js" }

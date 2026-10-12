@@ -1,352 +1,208 @@
-# OIE Sentinel
+# OIE 哨兵
 
-Zabbix-inspired monitoring and alerting for [Open Integration Engine](https://openintegrationengine.org)
-channel activity — inactivity, low-volume, anomaly, connection-status, error-rate and queue-depth
-monitors, with email, channel (VM Router), AWS SNS and webhook alert delivery, storm control and
-escalation, and a dashboard embedded directly in the OIE Web Administrator.
+借鉴 Zabbix 的 [Open Integration Engine](https://openintegrationengine.org) 通道活动监控与告警 — 不活动、低流量、异常、连接状态、错误率和队列深度监控器，支持邮件、通道 (VM Router)、AWS SNS 和 Webhook 告警投递，风暴控制和升级链，以及直接嵌入 OIE Web 管理员的仪表盘。
 
-No Swing desktop client, and no standalone web app either — the UI is built entirely against the
-`oie-web-client` plugin contract (`@oie/web-api`/`web-ui`/`web-shell`) and loads inside the main
-console, riding its existing session (no separate login).
+没有 Swing 桌面客户端，也没有独立的 Web 应用 — 界面完全基于 `oie-web-client` 插件契约（`@oie/web-api`/`web-ui`/`web-shell`）构建，并在主控制台内加载，复用其现有会话（无需单独登录）。
 
-![Sentinel dashboard](docs/screenshots/dashboard.png)
+![Sentinel 仪表盘](docs/screenshots/dashboard.png)
 
-## Features
+## 功能特性
 
-**Monitors**
-- Seven monitor types: **Inactivity** (no messages for N minutes), **Low volume** (fewer than N
-  messages per window), **Anomaly** (volume deviates from a rolling baseline), **Connection
-  status** (connector state matching), **Error rate** (errored share of received messages over a
-  window, with a minimum-volume guard so one error on a quiet channel is not 100%), **Queue
-  depth** (destination queue at or above a threshold for a sustained period), and **Channel
-  state** (see below).
-- Connection-status monitors roll up per connector or once per channel, so one channel losing its
-  upstream pages once instead of once per destination.
-- Scoped to a single channel, a channel group, a **channel tag**, or all channels — group and tag
-  membership resolve live, so reorganizing channels never requires touching monitors.
-- Per-monitor severity (Information → Disaster), minimum consecutive breaches, and dependency
-  suppression (a parent monitor's open problem silences its dependents on the same channel).
+**监控器**
+- 七种监控器类型：**不活动**（N 分钟内无消息）、**低流量**（每窗口消息少于 N 条）、**异常**（流量偏离滚动基线）、**连接状态**（连接器状态匹配）、**错误率**（窗口内接收消息中的错误占比，带最低流量保护以避免安静通道上的单个错误被计为 100%）、**队列深度**（目标队列在持续时间内达到或超过阈值）和**通道状态**（见下文）。
+- 连接状态监控器按连接器汇总或按通道汇总一次，因此一个通道丢失上游页面时只报告一次而非每个目标一次。
+- 范围可设为单个通道、通道组、**通道标签**或所有通道 — 组和标签成员关系实时解析，因此重新组织通道无需修改监控器。
+- 每个监控器有严重级别（信息 → 灾难）、最小连续违规次数和依赖抑制（父监控器的未解决问题会静默同一通道上的依赖项）。
 
-### Channel state and connector monitoring follow deployment state
+### 通道状态和连接器监控跟随部署状态
 
-Activity monitors evaluate channels in `STARTED`: a stopped channel's source is not polling,
-so an inactivity or volume breach against it
-would be measuring the operator's own decision. The consequence is that stopping a production
-channel raises no alarm; it *silences* the alarms that channel already had, which the evaluator
-closes with "Channel is no longer started".
+活动监控器评估 `STARTED` 状态下的通道：已停止通道的源不在轮询，因此针对它的不活动或流量违规将衡量的是操作员自己的决定。其结果是，停止生产通道不会触发告警；它会*静默*该通道已有的告警，评估器以"通道不再处于启动状态"关闭。
 
-A **Connection status** monitor evaluates deployed connectors, including paused channels and
-channels deployed only on another live cluster node. Missing observations remain insufficient data
-until the deployment inventory and connector state can be established.
+**连接状态**监控器评估已部署的连接器，包括已暂停的通道和仅部署在另一个活动集群节点上的通道。在部署清单和连接器状态建立之前，缺失的观测仍视为数据不足。
 
-A **Channel state** monitor watches the state itself, so it is resolved against every channel in
-scope whatever state it is in. It defaults to the resting states — `STOPPED`, `PAUSED`,
-`UNDEPLOYED` — the ones a channel does not leave on its own. The transitional states (`STARTING`,
-`DEPLOYING`, `STOPPING`, …) are selectable but never seeded: every ordinary redeploy passes through
-them, and a default that paged on that would teach operators to ignore the monitor. Select one
-deliberately, with a minimum duration long enough to clear a normal deployment, to catch a channel
-stuck mid-start.
+**通道状态**监控器监控状态本身，因此针对范围内每个通道的任何状态进行解析。默认使用静止状态 — `STOPPED`、`PAUSED`、`UNDEPLOYED` — 即通道不会自行离开的状态。过渡状态（`STARTING`、`DEPLOYING`、`STOPPING`…）可选择但不会预设：每次正常重新部署都会经过这些状态，如果默认设置会对过渡状态报警，操作员会学会忽略监控器。有意识地选择一个，配合足够长的最短持续时间以清除正常部署时间，来捕获卡在启动中的通道。
 
-How long the state has held is read from the trigger row rather than from memory, so it survives a
-plugin restart — "stopped since before the last restart" is the likeliest shape of the incident
-this type exists to catch. The stamp is a lower bound: a monitor created while a channel is already
-stopped counts from its own first tick, so it breaches one minimum-duration later rather than
-immediately.
+状态持续时长从触发行读取而非从内存读取，因此在插件重启后仍然有效 — "在上次重启前就已停止"是这种监控器类型存在的意义。时间戳是下界：在通道已停止时创建的监控器从自己的首次计算开始计时，因此在一个最短持续时间后才违规而非立即违规。
 
-**Problems**
-- Problem list with server-side filtering/paging, bulk acknowledge, and a detail pane with the
-  captured value and dispatched-action log.
-- Acknowledge and manual resolve, each confirmed in a single dialog with an optional comment;
-  acknowledgments display the engine username.
-- **Acknowledging stops repeat notifications** without resolving the problem — the alarm stays open
-  so it cannot re-fire while the condition persists, and the resolve notification still goes out
-  when it clears.
+**问题**
+- 问题列表支持服务端过滤/分页、批量确认，以及详情面板显示捕获值和调度动作日志。
+- 确认和手动解决，各在一个对话框中确认并附带可选注释；确认显示引擎用户名。
+- **确认会停止重复通知**而不解决问题 — 告警保持打开状态，因此在条件持续期间不会重新触发，而解决通知仍会在条件清除时发出。
 
-**Actions (alert delivery)**
-- Email (engine SMTP), Channel (route the alert payload into an OIE channel via VM Router), AWS
-  SNS, and Webhook (HTTPS POST to Slack, Teams, PagerDuty, Alertmanager…) senders.
-- Every transport call has the same 30-second hard wall-clock ceiling (a transport may use a
-  shorter one); expiry cancels the call and releases the bounded dispatch worker.
-- Open and resolution notifications use ordered durable outbox flags and reconcile missing
-  per-action dispatch rows. A full dispatch queue, restart, short-lived incident, or partial fan-out
-  therefore delays a one-shot edge instead of losing it. A crash between an external send and its
-  dispatch-log commit can cause a duplicate on retry.
-- **Storm control**: a per-action notification ceiling over a rolling window, past which individual
-  sends are held and one rollup notification names the affected channels; plus flap detection, so a
-  trigger bouncing between problem and OK notifies once and then goes quiet until it settles.
-- **Escalation chains**: a problem still open after N seconds routes to a different action — a
-  wider audience — with cycle and hop-count guards. Acknowledged problems never escalate.
-- Condition-based routing: severity (including `>=` thresholds), monitor type, **specific
-  monitors** (multi-select), channel, channel group, **channel tag**, and event type — rows are
-  ANDed; an action with no conditions fires for everything its mode covers.
-- Repeat notifications per action (`repeat interval` + optional `max repeats`), paced through the
-  dispatch log so repeat state survives server restarts.
-- Drag-and-drop template tokens (`${monitorName}`, `${channelName}`, `${severity}`, `${status}`,
-  `${message}`) for the email subject template.
+**动作（告警投递）**
+- 邮件（引擎 SMTP）、通道（通过 VM Router 将告警载荷路由到 OIE 通道）、AWS SNS 和 Webhook（HTTPS POST 到 Slack、Teams、PagerDuty、Alertmanager…）发送器。
+- 每个传输调用都有相同的 30 秒硬时钟上限（传输可使用更短的上限）；到期取消调用并释放绑定的调度工作线程。
+- 打开和解决通知使用有序的持久外发标志并协调缺失的每动作调度行。因此完整的调度队列、重启、短事件或部分扇出会延迟一次性边缘而非丢失它。在外部发送和调度日志提交之间崩溃可能导致重试时重复。
+- **风暴控制**：每动作在滚动窗口内的通知上限，超过后单个发送被保留，一个汇总通知列出受影响的通道；加上抖动检测，因此触发器在问题和正常之间来回跳动时只通知一次然后静默直到稳定。
+- **升级链**：问题在 N 秒后仍未解决时路由到不同的动作 — 更广泛的受众 — 带循环和跳转次数保护。已确认的问题不会升级。
+- 基于条件的路由：严重级别（包括 `>=` 阈值）、监控器类型、**特定监控器**（多选）、通道、通道组、**通道标签**和事件类型 — 行之间为 AND 关系；没有条件的动作对其模式覆盖的所有内容触发。
+- 每动作重复通知（`重复间隔` + 可选 `最大重复次数`），通过调度日志进行节奏控制，因此重复状态在服务器重启后仍然保留。
+- 拖放模板令牌（`${monitorName}`、`${channelName}`、`${severity}`、`${status}`、`${message}`）用于邮件主题模板。
 
-**Schedules** (the *Schedules* tab)
-- **Suppress** schedules — classic maintenance windows: notification decisions made while the
-  window is active stay silent. A problem still open when maintenance ends gets its first
-  notification then.
-- **Alerting schedule** windows: the inverse — alerts on covered channels notify *only inside* the
-  window (business hours, on-call rotations). Problems that opened during quiet hours are checked
-  on every tick and notify on window entry if they remain open.
-- Suppression is checked on the dispatch worker for opens, repeats, escalations and resolutions,
-  so schedule edits and parent-monitor recovery take effect before a queued transport call rather
-  than being frozen into the alert's creation-time state.
-- One-time, weekly (days of week), or monthly (days of month) recurrence with start/end times on a
-  **per-window time zone** — pick the zone your on-call rotation lives in and the schedule keeps its
-  length across daylight-saving changes there; leave it blank to follow the OIE server's own clock.
-  End at or before start wraps past midnight (e.g. 22:00–06:00).
-- "Activate now" re-times a one-time window mid-incident without editing it.
+**计划**（*计划*选项卡）
+- **抑制**计划 — 经典维护窗口：在窗口激活期间做出的通知决策保持静默。维护结束时仍未解决的问题会收到第一条通知。
+- **告警计划**窗口：相反 — 覆盖通道上的告警仅在窗口*内*通知（工作时间、值班轮换）。在静默时间内打开的问题在每个检查周期检查，并在窗口进入时如果仍然打开则通知。
+- 抑制在调度工作线程上针对打开、重复、升级和解决进行检查，因此计划编辑和父监控器恢复在排队传输调用之前生效，而非被冻结到告警的创建时状态。
+- 一次性、每周（星期）或每月（日期）循环，配合**每窗口时区**的开始/结束时间 — 选择值班轮换所在的时区，计划在其夏令时变更中保持长度；留空则跟随 OIE 服务器自身时钟。结束时间早于或等于开始时间则跨午夜（例如 22:00–06:00）。
+- "立即激活"在事件中途中新计时一次性窗口而无需编辑。
 
-**Outside the Sentinel tab.** Sentinel adds a column to the Dashboard and entries to the command
-palette — so an operator does not have to know Sentinel exists to see that a channel is alarming.
-Both only read Sentinel state or navigate into the plugin; everything that changes a monitor, an
-action or a schedule lives in Sentinel's own UI.
+**在哨兵选项卡之外。** 哨兵在仪表盘中添加列并在命令面板中添加条目 — 因此操作员无需知道哨兵的存在即可看到通道正在告警。两者都只读取哨兵状态或导航到插件；所有更改监控器、动作或计划的操作都在哨兵自己的界面中。
 
-**A Sentinel column in the Dashboard's channel table.** One badge per channel, in three states:
+**仪表盘中通道表的哨兵列。** 每个通道一个徽章，三种状态：
 
-| Badge | Meaning |
+| 徽章 | 含义 |
 | --- | --- |
-| A **count**, filled in the severity colour | Open problems. The number is how many are open, the colour is the highest severity among them — three Information problems and one Disaster are very different situations, and a count or a colour alone would render them identically. Click it to open that channel's problems. |
-| A green **✓** outline | Monitored, nothing open. |
-| A dashed grey **–** | No enabled monitor covers this channel. Sentinel has nothing to say about it. |
+| **计数**，填充严重级别颜色 | 未解决问题。数字是打开的数量，颜色是其中最高的严重级别 — 三个信息问题和一个灾难是非常不同的情况，仅有计数或仅有颜色会以相同方式呈现它们。点击打开该通道的问题。 |
+| 绿色 **✓** 轮廓 | 已监控，无未解决问题。 |
+| 虚线灰色 **–** | 没有启用的监控器覆盖此通道。哨兵对此没有要报告的。 |
 
-That last distinction is the point of the column. Reporting "no monitor is watching this" the same
-way as "watched and healthy" would present the absence of a watcher as the absence of a problem,
-which is the most misleading thing a monitoring column could do. Coverage is resolved exactly —
-channel scope directly, group and tag scopes through membership, and one ALL-scoped monitor covering
-everything — using the same rule the evaluator applies. If the coverage lookup fails, the badge
-reports "still loading" and never falls back to "not watched".
+最后一个区别是该列的意义。将"没有监控器在监视"与"已监视且健康"以相同方式呈现，会将无监视者呈现为无问题，这是监控列可能做的最具误导性的事情。覆盖范围精确解析 — 通道范围直接解析，组和标签范围通过成员关系解析，一个 ALL 范围监控器覆盖一切 — 使用评估器应用的相同规则。如果覆盖查找失败，徽章报告"仍在加载"而非回退到"未被监视"。
 
-Open problems are polled once for the whole table rather than once per row; coverage is re-read
-every five minutes, since it only changes when somebody edits a monitor.
+未解决问题对整个表轮询一次而非每行一次；覆盖每五分钟重新读取一次，因为它只在有人编辑监控器时更改。
 
-**Command palette** (⌘K / Ctrl+K, then `>`) entries:
+**命令面板**（⌘K / Ctrl+K，然后 `>`）条目：
 
-| Entry | Section | Needs |
+| 条目 | 分区 | 需要 |
 | --- | --- | --- |
-| Sentinel: Dashboard | Monitor | View Monitoring |
-| Sentinel: Open problems | Monitor | View Monitoring |
-| Sentinel: Unacknowledged problems | Monitor | View Monitoring |
-| Sentinel: Schedules | Monitor | View Monitoring |
-| New Sentinel Monitor | Create | Manage Monitoring |
+| Sentinel: Dashboard | 监控 | View Monitoring |
+| Sentinel: Open problems | 监控 | View Monitoring |
+| Sentinel: Unacknowledged problems | 监控 | View Monitoring |
+| Sentinel: Schedules | 监控 | View Monitoring |
+| New Sentinel Monitor | 创建 | Manage Monitoring |
 
-The first four open a Sentinel tab; the last opens a blank monitor editor and sits in the palette's
-*Create* section with the host's own New Channel and New Alert. All register into the host's palette
-rather than a Sentinel-specific one, so they sit alongside its built-in entries and are filtered
-through the same permission check it applies to those.
+前四个打开哨兵选项卡；最后一个打开空白监控器编辑器，与主机自己的"新建通道"和"新建告警"一起位于面板的*创建*分区。所有都注册到主机的面板而非哨兵特定的面板，因此它们与内置条目并列，并通过相同的权限检查过滤。
 
-**Operations**
-- Dashboard tab with problem counts by severity, per-channel activity charts, and top channels.
-- Per-monitor history: alert count and mean time-to-resolve over time.
-- Optional **runbook URL** per monitor, shown on the problem and available as `${runbookUrl}` in
-  every alert template.
-- **Prometheus endpoint** at `/extensions/sentinel/metrics` — open problems by severity, per-channel
-  throughput, and collector/evaluator heartbeat age, honouring channel restrictions.
-- **Export / import** of monitors, actions and schedules as one JSON document, matched by name and
-  reported entity by entity, so configuration is promotable dev → test → prod and
-  version-controllable.
-- Five RBAC permissions published for authorization plugins (see [Permissions](#permissions)).
-- Mutations audited through the engine's event log; alert history, trigger state, and activity
-  samples persist across restarts with configurable retention.
-- **Sizing the sample table:** rows per day is `channels × 86400 / interval`. At the 30-second
-  collector default, 200 channels write 576,000 rows a day and stand at roughly 4 million rows
-  under the 7-day raw-sample retention default — in the engine's operational database, alongside
-  message data. Raise the collector interval or lower the sample retention to size it down. Each
-  tick is written as a single batched insert regardless of channel count.
+**运维**
+- 仪表盘选项卡，包含按严重级别统计的问题计数、每通道活动图表和热门通道。
+- 每监控器历史记录：告警数量和平均解决时间。
+- 每监控器可选**运维手册 URL**，显示在问题上并作为 `${runbookUrl}` 在每个告警模板中可用。
+- **Prometheus 端点**在 `/extensions/sentinel/metrics` — 按严重级别的未解决问题、每通道吞吐量以及采集器/评估器心跳年龄，遵循通道限制。
+- **导出/导入**监控器、动作和计划为一个 JSON 文档，按名称匹配并逐实体报告，因此配置可在开发 → 测试 → 生产之间提升并支持版本控制。
+- 发布五个 RBAC 权限供授权插件使用（参见[权限](#权限)）。
+- 变更操作通过引擎事件日志审计；告警历史、触发状态和活动样本在重启后持续保留，保留期可配置。
+- **样本表大小估算：** 每天行数 = `通道数 × 86400 / 间隔`。按 30 秒采集器默认值，200 个通道每天写入 576,000 行，在 7 天原始样本保留默认值下约 400 万行 — 在引擎的运营数据库中，与消息数据共存。提高采集器间隔或降低样本保留期以缩小规模。每次采集无论通道数量都以单个批量插入写入。
 
-### Activity retention has two independent tiers
+### 活动保留有两个独立层级
 
-Raw collector samples (`sampleRetentionDays`, default 7, max 90) are tick resolution — one row per
-watched channel per collector interval — and are what the activity chart's **Raw** granularity
-draws. The hourly rollup (`trendRetentionDays`, default 90, max 3650) is a separate tier, written
-by the rollup job and pruned on its own schedule, and is what **Hourly** draws.
+原始采集器样本（`sampleRetentionDays`，默认 7 天，最大 90 天）是刻度分辨率 — 每个受监视通道每个采集器间隔一行 — 活动图表的**原始**粒度绘制的就是这些数据。每小时汇总（`trendRetentionDays`，默认 90 天，最大 3650 天）是独立层级，由汇总作业写入并按自己的计划修剪，**每小时**绘制的就是这些数据。
 
-Neither tier's lifetime derives from the other. A year-long chart is available out of the box at
-hourly resolution even though raw samples were pruned after a week, and raising
-`sampleRetentionDays` does not lengthen trend history.
+两个层级的生命周期互不依赖。即使原始样本在一周后被修剪，开箱即可使用每小时分辨率查看一年图表，而提高 `sampleRetentionDays` 不会延长趋势历史。
 
-**Auto** picks raw for ranges up to 6 hours and hourly beyond that. That is a rule about *range
-width*, not about what data still exists — raw samples cover the whole sample-retention window, so
-to chart tick resolution across a three-day incident, select **Raw** explicitly.
+**自动**在范围不超过 6 小时时选择原始数据，超过则选择每小时数据。这是关于*范围宽度*的规则，而非关于哪些数据仍然存在 — 原始样本覆盖整个样本保留窗口，因此要在三天事件中绘制刻度分辨率图表，请显式选择**原始**。
 
-Any series is capped at 2000 points: a wider range is folded into equal buckets server-side, and
-the caption under the chart reports what was actually drawn (for example "hourly rollup, 1h5m
-buckets") rather than what was requested.
+任何序列上限为 2000 个点：更宽的范围在服务端折叠为等宽桶，图表下方的标题报告实际绘制内容（例如"每小时汇总，1 小时 5 分钟桶"）而非请求的内容。
 
-**Long retention belongs to the hourly tier, not the raw one.** Raw samples are capped at 90 days
-precisely because they are 120× denser: at a 30-second collector each channel writes 2,880 raw rows
-a day but only 24 hourly ones. A year of history for 200 channels is about 1.75 million hourly rows
-— trivial. The same year at raw resolution would be 210 million, which is why it isn't offered.
+**长期保留属于每小时层级而非原始层级。** 原始样本上限为 90 天，因为它们的密度恰好是 120 倍：按 30 秒采集器，每个通道每天写入 2,880 行原始数据但只有 24 行每小时数据。200 个通道一年的历史约为 175 万行每小时数据 — 微不足道。相同一年的原始分辨率将是 2.1 亿行，这就是为什么不提供该选项。
 
-### Pruning
+### 修剪
 
-A nightly job at 03:30 (leadership-gated, so one node in a cluster) removes raw samples, hourly
-buckets, resolved alerts and connector status transitions past their retention (connector status
-events share the raw-sample retention). Open problems are never pruned regardless of age, and
-dispatch history follows its alert out by cascade. Retention values are re-read on every run, so
-a settings change takes effect that night with no restart.
+每天 03:30 的夜间作业（领导权门控，集群中仅一个节点）移除超过保留期的原始样本、每小时桶、已解决告警和连接器状态转换（连接器状态事件共享原始样本保留期）。无论年龄多大，未解决的问题永远不会被修剪，调度历史通过级联跟随告警。保留值在每次运行时重新读取，因此设置更改当天晚上生效，无需重启。
 
-Deletes run in bounded passes of 5,000 rows rather than one statement, each its own transaction.
-This matters for one specific operation: **lowering** a retention setting. Dropping
-`sampleRetentionDays` from 90 to 7 asks the next prune to remove 83 days at once — roughly 48
-million rows for 200 channels — and as a single transaction that means a long table lock, a
-transaction log sized for the whole delete, and on PostgreSQL enough dead tuples to need a manual
-`VACUUM`. Chunking bounds all three, and an interrupted prune simply leaves the remainder for the
-next night.
+删除以 5,000 行为上限的批次运行而非单个语句，每个批次是独立事务。这对一个特定操作很重要：**降低**保留设置。将 `sampleRetentionDays` 从 90 降到 7 要求下次修剪一次移除 83 天 — 200 个通道约 4800 万行 — 作为单个事务意味着长时间表锁、为整个删除大小的事务日志，以及在 PostgreSQL 上足够的死元组需要手动 `VACUUM`。分块限制所有三项，中断的修剪只需将剩余留给下一晚。
 
-## Screenshots
+## 截图
 
 | | |
 | --- | --- |
-| ![Problems list](docs/screenshots/problems.png) | ![Monitors](docs/screenshots/monitors.png) |
-| ![Action editor](docs/screenshots/action-editor.png) | ![Settings](docs/screenshots/settings.png) |
+| ![问题列表](docs/screenshots/problems.png) | ![监控器](docs/screenshots/monitors.png) |
+| ![动作编辑器](docs/screenshots/action-editor.png) | ![设置](docs/screenshots/settings.png) |
 
-## Requirements
+## 系统要求
 
-- OIE engine **4.6.0** — the engine loads a plugin only on the exact versions listed in its
-  descriptor, so each new engine release needs a Sentinel release that has been verified against
-  it (see `plugin.supported.mc.versions` in `pom.xml`)
-- [oie-web-client](https://github.com/gibson9583/oie-web-client) (OIE Web Administrator) to host
-  the dashboard UI
-- Server restart after install/upgrade
+- OIE 引擎 **4.6.0** — 引擎仅在描述文件中列出的精确版本上加载插件，因此每个新引擎版本都需要经过验证的哨兵发布版本（参见 `pom.xml` 中的 `plugin.supported.mc.versions`）
+- [oie-web-client](https://github.com/gibson9583/oie-web-client)（OIE Web 管理员）用于托管仪表盘界面
+- 安装/升级后需重启服务器
 
-### Clustered deployments
+### 集群部署
 
-Sentinel is safe to install on every node of a clustered engine. Background work — the collector,
-evaluator, hourly rollup and retention prune — is gated on a database-backed leadership lease
-(`sentinel_node_lease`), so exactly one node does it at a time while the others stand by. Without
-that gate, two nodes sharing a database would each write a full set of activity samples, doubling
-every message delta and corrupting every volume baseline, while both evaluators raced on the same
-trigger rows.
+哨兵可安全安装在集群引擎的每个节点上。后台工作 — 采集器、评估器、每小时汇总和保留修剪 — 通过数据库支持的领导权租约（`sentinel_node_lease`）门控，因此同一时间只有一个节点执行，其他节点待命。没有该门控，共享数据库的两个节点会各自写入完整的活动样本集，使每个消息增量翻倍并破坏每个流量基线，同时两个评估器竞争相同的触发行。
 
-The REST API and dashboard serve from **any** node, leader or not. Only scheduled work is
-leadership-gated.
+REST API 和仪表盘从**任何**节点服务，无论是领导者还是非领导者。只有计划工作受领导权门控。
 
-Connector transitions are node-qualified and every node maintains its own database-clock presence
-lease, including standbys. Each heartbeat atomically publishes that node's deployed-channel
-inventory with its presence lease. The leader evaluates connector state across the live nodes
-that deploy the channel. A clean stop removes that node immediately, while an unclean loss removes it after the 90-second
-presence lease expires. Historical rows are retained for diagnostics but a permanently retired
-node cannot keep a connector problem open forever. Leadership epochs are checked inside database
-transactions and immediately before notification transport starts. Pending notifications survive
-queue saturation and failover. Configure a stable engine server id on every cluster member;
-when the engine does not provide one, Sentinel derives a restart-stable fallback
-from the hostname and that installation's application-data directory.
+连接器转换是节点限定的，每个节点维护自己的数据库时钟存在租约，包括备用节点。每次心跳原子地发布该节点的已部署通道清单及其存在租约。领导者跨部署该通道的活动节点评估连接器状态。正常停止立即移除该节点，而非正常丢失在 90 秒存在租约到期后移除。历史行保留用于诊断，但永久退役的节点不能无限期保持连接器问题打开。领导权纪元在数据库事务内部和通知传输开始前立即检查。待处理通知在队列饱和和故障转移后仍然保留。在每个集群成员上配置稳定的引擎服务器 ID；当引擎未提供时，哨兵从主机名和该安装的应用数据目录派生重启稳定的回退值。
 
-Failover is automatic. A clean shutdown hands the lease over within about 30 seconds; an abrupt
-node loss takes up to about 2 minutes (a 90-second lease plus the next node's heartbeat). The new
-leader's first collector tick records zero deltas rather than counting each channel's lifetime
-total as one interval, so one tick of sampling is lost on failover by design. Leadership changes
-are logged at INFO, naming the node — the first thing to check during an HA incident.
+故障转移是自动的。正常关闭在约 30 秒内移交租约；突然节点丢失需要最多约 2 分钟（90 秒租约加上下一个节点的心跳）。新领导者的首次采集器计时记录零增量而非将每个通道的生命周期总计计为一个间隔，因此在故障转移时按设计丢失一次采样。领导权变更在 INFO 级别记录，命名节点 — 在 HA 事件中首先要检查的事项。
 
-For a clustered upgrade from 1.1.0, stop Sentinel on every node before starting the updated plugin.
-All nodes must use the new schema and fencing protocol before monitoring resumes.
+对于从 1.1.0 的集群升级，在启动更新的插件之前在每个节点上停止哨兵。所有节点必须在恢复监控之前使用新的架构和隔离协议。
 
-## Install
+## 安装
 
-1. Download `sentinel-<version>.zip` from [Releases](https://github.com/gibson9583/oie-sentinel/releases)
-   (or install from an OIE Community Store that lists this plugin).
-2. Install via the Web Administrator (Settings → Extensions) or drop the zip into the engine's
-   extension install flow, then restart the server.
-3. On first start the migrator creates eleven `sentinel_*` tables in the engine database (Derby,
-   PostgreSQL, MySQL, Oracle, and SQL Server DDL included); schema upgrades run automatically on
-   later versions.
+1. 从 [Releases](https://github.com/gibson9583/oie-sentinel/releases) 下载 `sentinel-<version>.zip`（或从列出此插件的 OIE 社区商店安装）。
+2. 通过 Web 管理员（设置 → 扩展）安装或将 zip 放入引擎的扩展安装流程，然后重启服务器。
+3. 首次启动时迁移器在引擎数据库中创建十一个 `sentinel_*` 表（包含 Derby、PostgreSQL、MySQL、Oracle 和 SQL Server DDL）；架构升级在后续版本自动运行。
 
-### Uninstalling does not delete your data
+### 卸载不会删除数据
 
-Uninstalling the extension **renames** the `sentinel_*` tables to
-`sentinel_<table>_uninstalled_<yyyyMMdd>` on the next startup rather than dropping them, so
-monitors, actions, windows, and alert history survive an accidental uninstall — the kind of record
-an audit asks for six months later. Reinstalling creates a fresh schema alongside the renamed
-tables; it does not adopt them, so restoring old data is a manual copy.
+卸载扩展会在下次启动时将 `sentinel_*` 表**重命名**为 `sentinel_<table>_uninstalled_<yyyyMMdd>` 而非删除，因此监控器、动作、窗口和告警历史在意外卸载后仍然保留 — 审计在六个月后要求的那种记录。重新安装会在重命名的表旁边创建新的架构；它不会采用它们，因此恢复旧数据需要手动复制。
 
-Clean the archives up yourself when you are sure, for example:
+确定后自行清理归档，例如：
 
 ```sql
 DROP TABLE sentinel_alert_event_uninstalled_20260806;
--- …and the other ten, child tables first
+-- ……以及其他十个，先删子表
 ```
 
-> **Derby exception:** on Derby the tables are left in place under their original names and nothing
-> is renamed. Derby refuses to rename any table referenced by a foreign key, and three of the eleven
-> are; renaming only the eight it permits would leave a half-schema that the migrator would correctly
-> refuse to start against. Reinstalling on Derby cleanly adopts the existing tables.
+> **Derby 例外：** 在 Derby 上，表保留原始名称不变，不进行重命名。Derby 拒绝重命名任何被外键引用的表，而十一个表中有三个被引用；仅重命名允许的八个会留下半个架构，迁移器正确地拒绝在此架构上启动。在 Derby 上重新安装会干净地采用现有表。
 
-Upgrading never triggers any of this — install the new version over the old one.
+升级永远不会触发上述任何操作 — 在旧版本上直接安装新版本。
 
-## Permissions
+## 权限
 
-Sentinel publishes five extension permissions so RBAC-style authorization plugins can map real
-operational roles:
+哨兵发布五个扩展权限，以便 RBAC 风格的授权插件映射实际操作角色：
 
-| Permission | Grants |
+| 权限 | 授予 |
 | --- | --- |
-| View Monitoring | All reads: dashboard, problems, monitors, actions, windows, activity |
-| Acknowledge Problems | Acknowledge, bulk acknowledge, manual resolve |
-| Manage Schedules | Schedule create/update/delete and "activate now" (on-call tier) |
-| Manage Monitoring | Monitor and action authoring, including delivery credentials and test sends |
-| Manage Settings | Scheduler intervals and data retention only |
+| View Monitoring | 所有读取：仪表盘、问题、监控器、动作、窗口、活动 |
+| Acknowledge Problems | 确认、批量确认、手动解决 |
+| Manage Schedules | 计划创建/更新/删除和"立即激活"（值班层级） |
+| Manage Monitoring | 监控器和动作编辑，包括传输凭证和测试发送 |
+| Manage Settings | 仅调度器间隔和数据保留 |
 
-Delivery credentials — SNS access keys and role ARNs — and recipient lists are part of an action's
-configuration, so they belong to Manage Monitoring. Manage Settings covers only the five
-scheduler-interval and retention values on the Settings page.
+传输凭证 — SNS 访问密钥和角色 ARN — 以及收件人列表是动作配置的一部分，因此属于 Manage Monitoring。Manage Settings 仅覆盖设置页面上的五个调度器间隔和保留值。
 
-Without an authorization plugin installed, the engine permits everything.
+未安装授权插件时，引擎允许所有操作。
 
-## Build
+## 构建
 
-Requires **JDK 21+** (the 4.6.0 engine jars are Java 21 bytecode; the plugin itself targets
-`--release 17`). On a fresh machine or wiped `~/.m2`, first install the 4.6.0 engine jars into the
-local Maven repository (the public repsy mirror does not carry every engine version) — the engine
-must be built first so its `setup/` output jars exist:
+需要 **JDK 21+**（4.6.0 引擎 jar 是 Java 21 字节码；插件本身目标为 `--release 17`）。在全新机器或清理过的 `~/.m2` 上，首先将 4.6.0 引擎 jar 安装到本地 Maven 仓库（公共 repsy 镜像不提供每个引擎版本）— 引擎必须先构建，使其 `setup/` 输出 jar 存在：
 
 ```bash
 ENGINE_DIR=/path/to/engine ./scripts/install-engine-jars.sh
 ```
 
-Then:
+然后：
 
 ```bash
-./build.sh          # or: mvn clean package
+./build.sh          # 或：mvn clean package
 ```
 
-Output: `package/target/sentinel-<version>.zip` — the installable extension archive, including the
-built `webadmin/` dashboard bundle. CI does the same, sourcing the engine jars from the published
-OIE distribution tarball instead of a local checkout (see `.github/workflows/build.yaml`).
+输出：`package/target/sentinel-<version>.zip` — 可安装的扩展归档，包含构建的 `webadmin/` 仪表盘包。CI 执行相同操作，从已发布的 OIE 发行版 tarball 获取引擎 jar 而非本地检出（参见 `.github/workflows/build.yaml`）。
 
-## Project structure
+## 项目结构
 
 ```
 oie-sentinel/
-├── shared/     JAX-RS interface (SentinelServletInterface) + DTOs
-├── server/     ServicePlugin, migrator, repositories, collector/evaluator jobs, alert senders
-├── package/    plugin.xml, per-vendor MyBatis mappers, assembly.xml
-├── webadmin/   the entire dashboard UI (embedded plugin for the OIE Web Administrator)
-└── build.sh    orchestrates mvn package (builds webadmin/ via frontend-maven-plugin) + zip
+├── shared/     JAX-RS 接口（SentinelServletInterface）+ DTO
+├── server/     ServicePlugin、迁移器、仓库、采集器/评估器作业、告警发送器
+├── package/    plugin.xml、每供应商 MyBatis 映射器、assembly.xml
+├── webadmin/   整个仪表盘界面（OIE Web 管理员的嵌入式插件）
+└── build.sh    编排 mvn package（通过 frontend-maven-plugin 构建 webadmin/）+ zip
 ```
 
-## Releasing
+## 发布
 
-See the [1.1.1 release notes](docs/releases/1.1.1.md), including the cluster upgrade instructions.
+参见 [1.1.1 发布说明](docs/releases/1.1.1.md)，包含集群升级说明。
 
 ```bash
 git tag v1.1.2 && git push origin v1.1.2
 ```
 
-The tag must match `oie.json`'s `version`. CI builds the bundle, stages a **draft** GitHub Release
-with the zip and its `.sha256` sidecar; publishing the release (a human step) triggers the optional
-catalog PR that files the version manifest to the community catalog configured via the
-`CATALOG_REPO` Actions variable and `CATALOG_TOKEN` secret. Tags containing a hyphen (e.g.
-`v0.2.0-rc1`) publish as pre-releases.
+标签必须与 `oie.json` 的 `version` 匹配。CI 构建打包，暂存**草稿** GitHub Release，附带 zip 及其 `.sha256` 校验文件；发布 Release（人工步骤）触发可选的目录 PR，将版本清单提交到通过 `CATALOG_REPO` Actions 变量和 `CATALOG_TOKEN` 密钥配置的社区目录。包含连字符的标签（如 `v0.2.0-rc1`）作为预发布版发布。
 
-## Design
+## 设计
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full schema, REST API,
-collection/evaluation pipeline, and web-UI design this project was scaffolded from.
+参见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 了解完整的架构、REST API、采集/评估管道和 Web 界面设计。
 
-## License
+## 许可证
 
 [MPL-2.0](LICENSE)
