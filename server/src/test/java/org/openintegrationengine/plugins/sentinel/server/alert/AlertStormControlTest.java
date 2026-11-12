@@ -14,6 +14,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -67,6 +68,8 @@ class AlertStormControlTest {
     private MockedStatic<AlertEventRepository> alertEventRepository;
     private MockedStatic<ActionDispatchLogRepository> dispatchLogRepository;
     private MockedStatic<ScopeResolver> scopeResolver;
+    private MockedStatic<org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository> monitors;
+    private MockedStatic<org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression> policy;
 
     /** The recent events the ceiling scan walks. */
     private final List<AlertEvent> recentEvents = new ArrayList<>();
@@ -80,13 +83,29 @@ class AlertStormControlTest {
         alertEventRepository.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt()))
                 .thenReturn(recentEvents);
         dispatchLogRepository = Mockito.mockStatic(ActionDispatchLogRepository.class);
+
         scopeResolver = Mockito.mockStatic(ScopeResolver.class);
+        alertEventRepository.when(() -> AlertEventRepository.getAlertEvent(Mockito.anyLong()))
+                .thenAnswer(call -> recentEvents.stream().filter(event -> event.getId().equals(call.getArgument(0)))
+                        .findFirst().orElse(null));
+        monitors = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository.class);
+        org.openintegrationengine.plugins.sentinel.shared.model.Monitor monitor = new org.openintegrationengine.plugins.sentinel.shared.model.Monitor();
+        monitor.setId(7);
+        monitor.setEnabled(true);
+        monitors.when(() -> org.openintegrationengine.plugins.sentinel.server.db.MonitorRepository.getMonitor(7)).thenReturn(monitor);
+        policy = Mockito.mockStatic(org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.class);
+        policy.when(() -> org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.decision(any(), any()))
+                .thenAnswer(call -> ((AlertEvent) call.getArgument(0)).isSuppressed()
+                        ? org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.Decision.SUPPRESS
+                        : org.openintegrationengine.plugins.sentinel.server.engine.NotificationSuppression.Decision.ALLOW);
         scopeResolver.when(() -> ScopeResolver.channelName(anyString()))
                 .thenAnswer(invocation -> "name:" + invocation.getArgument(0));
     }
 
     @AfterEach
     void tearDown() {
+        policy.close();
+        monitors.close();
         scopeResolver.close();
         dispatchLogRepository.close();
         alertEventRepository.close();
@@ -100,6 +119,7 @@ class AlertStormControlTest {
         action.setId(10);
         action.setName("Page on-call");
         action.setEnabled(true);
+        action.setOperationMode(org.openintegrationengine.plugins.sentinel.shared.model.OperationMode.BOTH);
         action.setMaxNotificationsPerWindow(max);
         action.setRollupWindowSeconds(windowSeconds);
         return action;
@@ -120,6 +140,8 @@ class AlertStormControlTest {
         return event;
     }
 
+    private final List<ActionDispatchLog> rangeRows = new ArrayList<>();
+
     /** Attaches dispatch rows for action 10 to an event: one per age, oldest first. */
     private void rowsFor(AlertEvent event, String marker, long... secondsAgo) {
         List<ActionDispatchLog> rows = new ArrayList<>();
@@ -134,6 +156,9 @@ class AlertStormControlTest {
         }
         dispatchLogRepository.when(() -> ActionDispatchLogRepository
                 .listActionDispatchLogsForEvent(event.getId())).thenReturn(rows);
+        rangeRows.addAll(rows);
+        dispatchLogRepository.when(() -> ActionDispatchLogRepository.listActionDispatchLogsInRange(any(), any()))
+                .thenReturn(rangeRows);
     }
 
     private static AlertStormControl.CeilingVerdict verdict(Action action) {
@@ -243,6 +268,52 @@ class AlertStormControlTest {
             AlertStormControl.releaseReservation(blocked);
 
             assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(action).outcome());
+        }
+
+        @Test
+        void failedSummaryLookupDoesNotReserveAnUndeliveredRollup() {
+            AtomicInteger reads = new AtomicInteger();
+            alertEventRepository.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt()))
+                    .thenAnswer(call -> {
+                        if (reads.incrementAndGet() == 2) {
+                            throw new IllegalStateException("transient subject lookup failure");
+                        }
+                        return recentEvents;
+                    });
+            Action action = ceilingAction(0, 600);
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome(),
+                    "summary failures still fail open");
+            AlertStormControl.CeilingVerdict recovered =
+                    AlertStormControl.ceilingVerdict(action, NOW.plusMillis(100));
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, recovered.outcome(),
+                    "retry must not wait for the two-second snapshot expiry");
+            assertEquals(AlertStormControl.CeilingOutcome.SILENT,
+                    AlertStormControl.ceilingVerdict(action, NOW.plusMillis(200)).outcome(),
+                    "the successful retry still owns the one-rollup reservation");
+            AlertStormControl.releaseReservation(recovered);
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP,
+                    AlertStormControl.ceilingVerdict(action, NOW.plusMillis(300)).outcome(),
+                    "a final policy rejection can release the recovered reservation normally");
+        }
+
+        @Test
+        void repeatedSummaryFailuresLeaveOtherActionsAndFutureRollupsAvailable() {
+            AtomicInteger reads = new AtomicInteger();
+            alertEventRepository.when(() -> AlertEventRepository.listRecentAlertEvents(anyInt()))
+                    .thenAnswer(call -> {
+                        int read = reads.incrementAndGet();
+                        if (read == 2 || read == 3) throw new AssertionError("failed subject lookup");
+                        return recentEvents;
+                    });
+            Action action = ceilingAction(0, 600);
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome());
+            assertEquals(AlertStormControl.CeilingOutcome.SEND, verdict(action).outcome());
+            Action other = ceilingAction(0, 600);
+            other.setId(11);
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(other).outcome());
+            assertEquals(AlertStormControl.CeilingOutcome.ROLLUP, verdict(action).outcome());
+            assertEquals(AlertStormControl.CeilingOutcome.SILENT, verdict(other).outcome(),
+                    "releasing one action's failed claim must not release another action's claim");
         }
 
         @Test

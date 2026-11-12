@@ -6,6 +6,7 @@
 package org.openintegrationengine.plugins.sentinel.server.engine;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -372,24 +373,22 @@ public final class ScopeResolver {
      * for a picker/filter, but would let a notification leak through a
      * maintenance window that actually covers the unread member.
      */
-    static Set<String> strictGroupChannelIds(String groupId) {
+    public static Set<String> strictGroupChannelIds(String groupId) {
         Set<String> channelIds = new HashSet<>();
-        if (groupId == null) {
-            return channelIds;
-        }
+        if (groupId == null) return channelIds;
         List<ChannelGroup> groups = ChannelController.getInstance().getChannelGroups(null);
-        if (groups == null) {
-            throw new IllegalStateException("Channel-group inventory is unavailable");
-        }
+        if (groups == null) throw new IllegalStateException("Channel-group inventory is unavailable");
         for (ChannelGroup group : groups) {
+            if (group == null || group.getId() == null) {
+                throw new IllegalStateException("Channel-group identity is unavailable");
+            }
             if (groupId.equals(group.getId())) {
-                if (group.getChannels() != null) {
-                    for (Channel member : group.getChannels()) {
-                        String channelId = member.getId();
-                        if (channelId != null) {
-                            channelIds.add(channelId);
-                        }
-                    }
+                List<Channel> members = group.getChannels();
+                if (members == null) throw new IllegalStateException("Channel-group membership is unavailable");
+                for (Channel member : members) {
+                    String channelId = member != null ? member.getId() : null;
+                    if (channelId == null) throw new IllegalStateException("Channel-group member identity is unavailable");
+                    channelIds.add(channelId);
                 }
                 return channelIds;
             }
@@ -428,20 +427,22 @@ public final class ScopeResolver {
     }
 
     /** Completeness-preserving tag resolution for safety policy decisions. */
-    static Set<String> strictTagChannelIds(String tagId) {
+    public static Set<String> strictTagChannelIds(String tagId) {
         Set<String> channelIds = new HashSet<>();
-        if (tagId == null) {
-            return channelIds;
-        }
+        if (tagId == null) return channelIds;
         Set<ChannelTag> tags = ControllerFactory.getFactory()
                 .createConfigurationController().getChannelTags();
-        if (tags == null) {
-            throw new IllegalStateException("Channel-tag inventory is unavailable");
-        }
+        if (tags == null) throw new IllegalStateException("Channel-tag inventory is unavailable");
         for (ChannelTag tag : tags) {
+            if (tag == null || tag.getId() == null) {
+                throw new IllegalStateException("Channel-tag identity is unavailable");
+            }
             if (tagId.equals(tag.getId())) {
-                if (tag.getChannelIds() != null) {
-                    channelIds.addAll(tag.getChannelIds());
+                Set<String> members = tag.getChannelIds();
+                if (members == null) throw new IllegalStateException("Channel-tag membership is unavailable");
+                for (String channelId : members) {
+                    if (channelId == null) throw new IllegalStateException("Channel-tag member identity is unavailable");
+                    channelIds.add(channelId);
                 }
                 return channelIds;
             }
@@ -458,17 +459,31 @@ public final class ScopeResolver {
      * @return all channel tags; never {@code null}
      */
     public static List<TagInfo> listTags() {
+        return listTags(null);
+    }
+
+    /**
+     * Restricted pickers expose only complete definitions whose nonempty
+     * membership is entirely authorized. Authorize the same membership copy
+     * that is serialized, rather than resolving the tag a second time.
+     */
+    public static List<TagInfo> listTags(Set<String> authorizedChannelIds) {
         List<TagInfo> infos = new ArrayList<>();
         Set<ChannelTag> tags = ControllerFactory.getFactory().createConfigurationController().getChannelTags();
         if (tags == null) {
             return infos;
         }
         for (ChannelTag tag : tags) {
+            Set<String> members = tag.getChannelIds();
+            List<String> memberIds = members != null ? new ArrayList<>(members) : new ArrayList<>();
+            if (authorizedChannelIds != null && (tag.getId() == null || tag.getId().isBlank()
+                    || !membersVisible(memberIds, authorizedChannelIds))) {
+                continue;
+            }
             TagInfo info = new TagInfo();
             info.setId(tag.getId());
             info.setName(tag.getName());
-            info.setChannelIds(tag.getChannelIds() != null
-                    ? new ArrayList<>(tag.getChannelIds()) : new ArrayList<>());
+            info.setChannelIds(memberIds);
             java.awt.Color color = tag.getBackgroundColor();
             info.setColorHex(color != null
                     ? String.format("#%02x%02x%02x", color.getRed(), color.getGreen(), color.getBlue())
@@ -525,6 +540,11 @@ public final class ScopeResolver {
      * @return all explicitly defined channel groups; never {@code null}
      */
     public static List<ChannelGroupInfo> listGroups() {
+        return listGroups(null);
+    }
+
+    /** Same complete-membership policy and snapshot boundary as {@link #listTags(Set)}. */
+    public static List<ChannelGroupInfo> listGroups(Set<String> authorizedChannelIds) {
         List<ChannelGroupInfo> infos = new ArrayList<>();
         List<ChannelGroup> groups = ChannelController.getInstance().getChannelGroups(null);
         if (groups == null) {
@@ -538,16 +558,37 @@ public final class ScopeResolver {
             // LinkedHashSet: dedupe defensively while preserving the group's
             // member order for a stable picker display.
             Set<String> memberIds = new LinkedHashSet<>();
-            if (group.getChannels() != null) {
-                for (Channel member : group.getChannels()) {
-                    if (member.getId() != null) {
-                        memberIds.add(member.getId());
+            List<Channel> members = group.getChannels();
+            boolean complete = members != null;
+            if (members != null) {
+                for (Channel member : members) {
+                    String memberId = member != null ? member.getId() : null;
+                    if (memberId != null) {
+                        memberIds.add(memberId);
+                    } else {
+                        complete = false;
                     }
                 }
+            }
+            if (authorizedChannelIds != null && (!complete || group.getId() == null || group.getId().isBlank()
+                    || !membersVisible(memberIds, authorizedChannelIds))) {
+                continue;
             }
             info.setChannelIds(new ArrayList<>(memberIds));
             infos.add(info);
         }
         return infos;
+    }
+
+    private static boolean membersVisible(Collection<String> members, Set<String> authorized) {
+        if (members.isEmpty()) {
+            return false;
+        }
+        for (String id : members) {
+            if (id == null || id.isBlank() || !authorized.contains(id)) {
+                return false;
+            }
+        }
+        return true;
     }
 }

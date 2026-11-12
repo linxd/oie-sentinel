@@ -5,15 +5,18 @@
  */
 package org.openintegrationengine.plugins.sentinel.server.db;
 
+import java.sql.Connection;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import org.apache.ibatis.session.ExecutorType;
 import org.apache.ibatis.session.SqlSession;
+import org.apache.ibatis.session.SqlSessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,7 +37,10 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  * so unlike {@code RbacRepository} this class carries no constructor-time
  * setup and needs no singleton lifecycle — plain static methods are
  * sufficient. Most statements here are a single MyBatis call and use
- * auto-commit. Two methods are not: {@link #replaceActivityTrendForHour(ActivityTrend)}
+ * auto-commit outside {@link #readActivitySnapshot(Supplier)}, which shares a
+ * managed read transaction across an evaluation's totals, coverage and baseline.
+ * Two write methods also use explicit transactions:
+ * {@link #replaceActivityTrendForHour(ActivityTrend)}
  * is a multi-statement sequence (delete-then-reinsert) and opens a
  * manual-commit session so a mid-flight failure leaves the prior bucket in
  * place rather than a deleted-but-not-reinserted gap, and
@@ -44,10 +50,30 @@ import org.openintegrationengine.plugins.sentinel.shared.model.ActivityTrend;
  */
 public final class ActivityRepository {
 
+    /** Maximum timestamps materialized by one coverage query, enforced in SQL. */
+    public static final int SAMPLE_TIME_PAGE_SIZE = 2_048;
+
     private static final String NAMESPACE = "Sentinel";
     private static final Logger log = LoggerFactory.getLogger(ActivityRepository.class);
 
     private ActivityRepository() {
+    }
+
+    /**
+     * Keeps totals, coverage pages and baseline reads in one database snapshot.
+     * A late collector insert must not certify an older aggregate, and retention
+     * must not remove measured rows between coverage and aggregation. SERIALIZABLE
+     * is supported by all five packaged databases, unlike REPEATABLE_READ on
+     * Oracle. Locking implementations may briefly delay collector/pruner writes;
+     * snapshot implementations keep this reader on one consistent version.
+     * No incident mutation or transport submission belongs inside this read scope.
+     * The callback may run twice after a confirmed deadlock rollback; it must
+     * recompute all reads without publishing state or performing external I/O.
+     */
+    public static <T> T readActivitySnapshot(Supplier<T> read) {
+        var sessions = SqlConfig.getInstance().getSqlSessionManager();
+        return DeadlockRetry.execute(sessions, "activity snapshot",
+                attempt -> ReadTransaction.execute(Connection.TRANSACTION_SERIALIZABLE, read, attempt));
     }
 
     /** Qualifies a mapped-statement id with the plugin's MyBatis namespace. */
@@ -139,10 +165,10 @@ public final class ActivityRepository {
      *                {@code id} field is ignored. A {@code null} or empty
      *                list is a no-op — a tick with no deployed channels must
      *                not open a session
-     * @throws RepositoryException on persistence failure. The transaction is
-     *                             rolled back, so no sample in the batch is
-     *                             persisted; callers must treat the whole
-     *                             tick as unwritten
+     * @throws RepositoryException on persistence failure. Confirmed deadlock
+     *                             victims are rolled back and retried once.
+     *                             Other failures, including uncertain commit
+     *                             outcomes, are propagated without replay.
      */
     public static void insertActivitySamples(List<ActivitySample> samples) {
         insertActivitySamples(samples, LeaseFence.unmanaged());
@@ -153,28 +179,72 @@ public final class ActivityRepository {
             return;
         }
 
-        SqlSession session = null;
         try {
-            session = SqlConfig.getInstance().getSqlSessionManager().openSession(ExecutorType.BATCH, false);
+            // Freeze the original observation values once. A retry must not
+            // re-read counters, choose another timestamp or acquire a new epoch.
+            List<Map<String, Object>> rows = new ArrayList<>(samples.size());
+            for (ActivitySample sample : samples) rows.add(toSampleColumnMap(sample));
+            SqlSessionManager sessions = SqlConfig.getInstance().getSqlSessionManager();
+            DeadlockRetry.execute(sessions, "activity sample batch", attempt -> {
+                insertActivitySampleBatch(sessions, rows, fence, attempt);
+                return null;
+            });
+        } catch (Exception e) {
+            log.error("Failed to insert batch of {} activity samples", samples.size(), e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    private static void insertActivitySampleBatch(SqlSessionManager sessions, List<Map<String, Object>> rows,
+            LeaseFence fence, DeadlockRetry.Attempt attempt) {
+        SqlSession session = null;
+        Connection connection = null;
+        Throwable failure = null;
+        boolean committed = false;
+        boolean cleanupFailed = false;
+        try {
+            session = sessions.openSession(ExecutorType.BATCH, false);
+            connection = session.getConnection();
             if (!NodeLeaseRepository.lockFence(session, fence)) {
                 throw new IllegalStateException("Sentinel leadership fence changed before sample batch");
             }
 
-            for (ActivitySample sample : samples) {
-                session.insert(stmt("insertActivitySample"), toSampleColumnMap(sample));
+            for (Map<String, Object> row : rows) {
+                session.insert(stmt("insertActivitySample"), row);
             }
 
-            // Flushes the accumulated batch and commits it; under BATCH
-            // nothing has reached the driver before this point.
+            // The fence SELECT flushes BATCH before checking expiry; commit
+            // flushes it for an unmanaged fence. Revalidate on every attempt.
             NodeLeaseRepository.requireFence(session, fence);
             session.commit();
-        } catch (Exception e) {
-            log.error("Failed to insert batch of {} activity samples", samples.size(), e);
-            throw new RepositoryException(e);
-        } finally {
-            if (session != null) {
-                session.close();
+            committed = true;
+        } catch (RuntimeException | Error error) {
+            failure = error;
+        }
+        if (session != null && failure != null) {
+            try {
+                // MyBatis 3.1.1 close can swallow a JDBC rollback exception.
+                // Force rollback explicitly before considering any retry.
+                session.rollback(true);
+            } catch (RuntimeException | Error rollback) {
+                if (failure != rollback) failure.addSuppressed(rollback);
+                cleanupFailed = true;
+                if (connection != null) ReadTransaction.abortConnection(sessions, connection, failure);
             }
+        }
+        if (session != null) {
+            try {
+                session.close();
+            } catch (RuntimeException | Error close) {
+                if (failure == null) failure = close;
+                else if (failure != close) failure.addSuppressed(close);
+                cleanupFailed = true;
+            }
+        }
+        if (failure instanceof Error) throw (Error) failure;
+        if (failure != null) {
+            if (!committed && !cleanupFailed && session != null) attempt.allowRetry();
+            throw (RuntimeException) failure;
         }
     }
 
@@ -205,6 +275,38 @@ public final class ActivityRepository {
             return samples;
         } catch (Exception e) {
             log.error("Failed to list activity samples for channel {} from {} to {}", channelId, from, to, e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /**
+     * Reads a bounded page of distinct observation times in an inclusive range.
+     * Pass the last returned timestamp as {@code after} for the next page (or
+     * null for the first). Distinct times keep duplicate observations from
+     * consuming the scan budget. The channel/time index supports ordered keyset
+     * traversal without OFFSET scans or loading the full activity row payload.
+     */
+    public static List<Instant> listActivitySampleTimes(String channelId, Instant from, Instant to,
+            Instant after, int limit) {
+        if (limit < 1 || limit > SAMPLE_TIME_PAGE_SIZE) {
+            throw new IllegalArgumentException("Activity timestamp page limit must be between 1 and "
+                    + SAMPLE_TIME_PAGE_SIZE);
+        }
+        try {
+            Map<String, Object> params = new HashMap<>();
+            params.put("channelId", channelId);
+            params.put("from", toTimestamp(from));
+            params.put("to", toTimestamp(to));
+            params.put("after", toTimestamp(after));
+            params.put("limit", limit);
+            List<Timestamp> rows = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectList(stmt("listActivitySampleTimes"), params);
+            List<Instant> times = new ArrayList<>(rows.size());
+            for (Timestamp row : rows) times.add(row == null ? null : row.toInstant());
+            return times;
+        } catch (Exception e) {
+            log.error("Failed to page activity sample times for channel {} from {} to {}",
+                    channelId, from, to, e);
             throw new RepositoryException(e);
         }
     }
@@ -288,31 +390,36 @@ public final class ActivityRepository {
     }
 
     public static void replaceActivityTrendForHour(ActivityTrend trend, LeaseFence fence) {
+        replaceActivityTrendsForHour(List.of(trend), fence);
+    }
+
+    /** Commits a complete hour together so a partial hour cannot advance the resume point. */
+    public static void replaceActivityTrendsForHour(List<ActivityTrend> trends, LeaseFence fence) {
+        if (trends.isEmpty()) return;
+        Instant hour = trends.get(0).getHourBucket();
+        if (hour == null || trends.stream().anyMatch(trend -> !hour.equals(trend.getHourBucket()))) {
+            throw new IllegalArgumentException("All replacement trends must belong to one hour");
+        }
         SqlSession session = null;
         try {
             session = SqlConfig.getInstance().getSqlSessionManager().openSession(false);
             if (!NodeLeaseRepository.lockFence(session, fence)) {
                 throw new IllegalStateException("Sentinel leadership fence changed before trend replacement");
             }
-
-            Map<String, Object> deleteParams = new HashMap<>();
-            deleteParams.put("channelId", trend.getChannelId());
-            deleteParams.put("hourBucket", toTimestamp(trend.getHourBucket()));
-            session.delete(stmt("deleteActivityTrendForHour"), deleteParams);
-
-            Map<String, Object> insertParams = toTrendColumnMap(trend);
-            session.insert(stmt("insertActivityTrend"), insertParams);
-
+            for (ActivityTrend trend : trends) {
+                Map<String, Object> deleteParams = new HashMap<>();
+                deleteParams.put("channelId", trend.getChannelId());
+                deleteParams.put("hourBucket", toTimestamp(trend.getHourBucket()));
+                session.delete(stmt("deleteActivityTrendForHour"), deleteParams);
+                session.insert(stmt("insertActivityTrend"), toTrendColumnMap(trend));
+            }
             NodeLeaseRepository.requireFence(session, fence);
             session.commit();
         } catch (Exception e) {
-            log.error("Failed to replace activity trend for channel {} hour {}",
-                    trend.getChannelId(), trend.getHourBucket(), e);
+            log.error("Failed to replace activity trends for hour {}", hour, e);
             throw new RepositoryException(e);
         } finally {
-            if (session != null) {
-                session.close();
-            }
+            if (session != null) session.close();
         }
     }
 
@@ -351,8 +458,8 @@ public final class ActivityRepository {
     /**
      * Returns the hour bucket of the most recent trend row across all
      * channels, or {@code null} when the trend table is empty. This is the
-     * rollup job's resume point: each run rolls forward from the hour after
-     * the last bucket any leader wrote, so hours missed to a restart,
+     * rollup job's resume point: each run replays the latest hour and rolls forward from
+     * that complete-hour checkpoint, so hours missed to a restart,
      * failover or thread-starved trigger are backfilled instead of skipped.
      *
      * @return the latest {@code hour_bucket}, or {@code null} when no trend
@@ -366,6 +473,29 @@ public final class ActivityRepository {
             return latest != null ? latest.toInstant() : null;
         } catch (Exception e) {
             log.error("Failed to read the latest activity trend hour bucket", e);
+            throw new RepositoryException(e);
+        }
+    }
+
+    /** Whether a channel bucket is already durable; replay must not replace it after raw pruning. */
+    public static boolean hasActivityTrendForHour(String channelId, Instant hour) {
+        try {
+            Integer count = SqlConfig.getInstance().getSqlSessionManager().selectOne(
+                    stmt("countActivityTrendForHour"), Map.of("channelId", channelId, "hourBucket", toTimestamp(hour)));
+            return count != null && count > 0;
+        } catch (Exception e) {
+            throw new RepositoryException("Failed to inspect existing activity trend", e);
+        }
+    }
+
+    /** Earliest retained sample, used to resume before the first successful rollup. */
+    public static Instant getEarliestActivitySampleTime() {
+        try {
+            Timestamp earliest = SqlConfig.getInstance().getSqlSessionManager()
+                    .selectOne(stmt("getEarliestActivitySampleTime"));
+            return earliest != null ? earliest.toInstant() : null;
+        } catch (Exception e) {
+            log.error("Failed to read the earliest activity sample time", e);
             throw new RepositoryException(e);
         }
     }

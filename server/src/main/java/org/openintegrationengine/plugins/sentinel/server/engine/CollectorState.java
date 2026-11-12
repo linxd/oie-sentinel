@@ -125,6 +125,8 @@ public final class CollectorState {
      * epoch. Its old counters span traffic already sampled by its successor;
      * retaining them would count that interval twice on failback. Renewal
      * keeps the epoch and its baseline, including after a failed DB batch.
+     * Started stamps must also begin again: another leader may have collected at
+     * a different cadence while this node was inactive.
      */
     synchronized void prepareCounterEpoch(LeaseFence fence) {
         if (fence == null) {
@@ -132,6 +134,7 @@ public final class CollectorState {
         }
         if (!fence.equals(counterEpoch)) {
             previousCounters.clear();
+            startedSince.clear();
             counterEpoch = fence;
         }
     }
@@ -231,7 +234,10 @@ public final class CollectorState {
      * @param channelId   the OIE channel id
      * @param windowStart start of the evaluation window being judged
      */
-    public boolean isChannelStartedThroughout(String channelId, Instant windowStart) {
+    public synchronized boolean isChannelStartedThroughout(String channelId, Instant windowStart) {
+        // An evaluator can run before the first collector tick after failback.
+        // Do not reuse the prior leader epoch's started stamps or cadence history.
+        if (!counterEpoch.equals(SentinelLeadership.captureFence())) return false;
         Instant since = startedSince.get(channelId);
         return since != null && !since.isAfter(windowStart);
     }
@@ -287,6 +293,8 @@ public final class CollectorState {
         public final ConnectionStatusEventType state;
         public final Instant since;
         public final Instant deploymentTime;
+        /** Latest same-state observation, separate from the transition's onset. */
+        final Instant observedThrough;
 
         public ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since) {
             this(channelId, metadataId, state, since, null);
@@ -294,11 +302,17 @@ public final class CollectorState {
 
         public ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
                 Instant deploymentTime) {
+            this(channelId, metadataId, state, since, deploymentTime, since);
+        }
+
+        ConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
+                Instant deploymentTime, Instant observedThrough) {
             this.channelId = channelId;
             this.metadataId = metadataId;
             this.state = state;
             this.since = since;
             this.deploymentTime = deploymentTime;
+            this.observedThrough = observedThrough;
         }
     }
 
@@ -347,8 +361,13 @@ public final class CollectorState {
 
     public void putConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
             Instant deploymentTime) {
+        putConnectorState(channelId, metadataId, state, since, deploymentTime, since);
+    }
+
+    void putConnectorState(String channelId, int metadataId, ConnectionStatusEventType state, Instant since,
+            Instant deploymentTime, Instant observedThrough) {
         connectorStates
                 .computeIfAbsent(channelId, id -> new ConcurrentHashMap<>())
-                .put(metadataId, new ConnectorState(channelId, metadataId, state, since, deploymentTime));
+                .put(metadataId, new ConnectorState(channelId, metadataId, state, since, deploymentTime, observedThrough));
     }
 }

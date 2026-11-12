@@ -8,12 +8,16 @@ package org.openintegrationengine.plugins.sentinel.server.service;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
+import java.util.function.Consumer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.function.Function;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -72,6 +76,25 @@ public final class MonitorService {
         return MonitorRepository.listMonitors(null, null, null, null);
     }
 
+    /** Lists only definitions whose complete scope is authorized for this request. */
+    public static List<Monitor> list(Set<String> authorizedChannelIds) {
+        if (authorizedChannelIds == null) return list();
+        if (authorizedChannelIds.isEmpty()) return List.of();
+        List<Monitor> monitors = list();
+        Map<Integer, Monitor> byId = new HashMap<>();
+        for (Monitor monitor : monitors) {
+            if (monitor.getId() != null) byId.put(monitor.getId(), monitor);
+        }
+        Map<Integer, Boolean> visibility = new HashMap<>();
+        List<Monitor> visible = new ArrayList<>();
+        for (Monitor monitor : monitors) {
+            if (definitionVisible(monitor, authorizedChannelIds, byId::get, visibility)) {
+                visible.add(monitor);
+            }
+        }
+        return visible;
+    }
+
     /**
      * Fetches one monitor.
      *
@@ -85,6 +108,47 @@ public final class MonitorService {
             throw new NoSuchElementException("No monitor with id " + id);
         }
         return monitor;
+    }
+
+    /** Hidden and missing definitions use the same not-found response. */
+    public static Monitor get(int id, Set<String> authorizedChannelIds) {
+        if (authorizedChannelIds == null) return get(id);
+        if (authorizedChannelIds.isEmpty()) throw new NoSuchElementException("No monitor with id " + id);
+        Monitor monitor = get(id);
+        if (!definitionVisible(monitor, authorizedChannelIds, MonitorRepository::getMonitor, new HashMap<>())) {
+            throw new NoSuchElementException("No monitor with id " + id);
+        }
+        return monitor;
+    }
+
+    /**
+     * A definition includes its suppression dependency. Hide the whole row
+     * when that chain is not readable: returning a redacted null parent
+     * would let an editor accidentally erase the stored dependency. Resolve
+     * iteratively so a corrupt long chain or cycle cannot overflow the stack.
+     */
+    private static boolean definitionVisible(Monitor monitor, Set<String> authorizedChannelIds,
+            Function<Integer, Monitor> lookup, Map<Integer, Boolean> known) {
+        Set<Integer> visited = new HashSet<>();
+        boolean visible = false;
+        while (monitor != null) {
+            Integer id = monitor.getId();
+            if (id == null || !visited.add(id)) break;
+            if (known.containsKey(id)) {
+                visible = known.get(id);
+                break;
+            }
+            if (!MonitorVisibility.isVisible(monitor, authorizedChannelIds)) break;
+            Integer parentId = monitor.getSuppressedByMonitorId();
+            if (parentId == null) {
+                visible = true;
+                break;
+            }
+            if (visited.contains(parentId)) break;
+            monitor = lookup.apply(parentId);
+        }
+        for (Integer id : visited) known.put(id, visible);
+        return visible;
     }
 
     /**
@@ -103,6 +167,11 @@ public final class MonitorService {
      * @throws IllegalArgumentException if validation fails
      */
     public static Monitor create(Monitor monitor, int userId) {
+        return create(monitor, userId, Runnable::run);
+    }
+
+    /** Import defers the audit event until its entry transaction commits. */
+    static Monitor create(Monitor monitor, int userId, Consumer<Runnable> afterCommit) {
         validate(monitor, null);
         Instant now = Instant.now();
         monitor.setId(null);
@@ -111,7 +180,7 @@ public final class MonitorService {
         monitor.setUpdatedBy(userId);
         monitor.setUpdatedTime(now);
         MonitorRepository.insertMonitor(monitor);
-        SentinelAuditLog.monitorCreated(userId, monitor);
+        afterCommit.accept(() -> SentinelAuditLog.monitorCreated(userId, monitor));
         return monitor;
     }
 
@@ -128,6 +197,11 @@ public final class MonitorService {
      * @throws IllegalArgumentException if validation fails
      */
     public static Monitor update(int id, Monitor monitor, int userId) {
+        return update(id, monitor, userId, Runnable::run);
+    }
+
+    /** Import defers the audit event until its entry transaction commits. */
+    static Monitor update(int id, Monitor monitor, int userId, Consumer<Runnable> afterCommit) {
         Monitor existing = get(id);
         validate(monitor, id);
         monitor.setId(id);
@@ -136,7 +210,7 @@ public final class MonitorService {
         monitor.setUpdatedBy(userId);
         monitor.setUpdatedTime(Instant.now());
         MonitorRepository.updateMonitor(monitor);
-        SentinelAuditLog.monitorUpdated(userId, monitor);
+        afterCommit.accept(() -> SentinelAuditLog.monitorUpdated(userId, monitor));
         return monitor;
     }
 
@@ -206,6 +280,16 @@ public final class MonitorService {
      *                                  incomplete to evaluate
      */
     public static MonitorTestResult test(Monitor monitor) {
+        return test(monitor, null);
+    }
+
+    /**
+     * Dry-runs only channels the caller may read. A null set means an
+     * unrestricted internal caller; an empty set means no channels. Filter
+     * before evaluation so neither measurements nor per-channel errors from
+     * unauthorized channels can enter the response.
+     */
+    public static MonitorTestResult test(Monitor monitor, Set<String> authorizedChannelIds) {
         if (monitor == null) {
             throw new IllegalArgumentException("Monitor body is required");
         }
@@ -233,6 +317,15 @@ public final class MonitorService {
         List<ScopeResolver.ChannelTarget> targets = watchesState
                 ? ScopeResolver.resolveScopedChannels(monitor)
                 : ScopeResolver.resolveStartedChannels(monitor);
+        if (authorizedChannelIds != null) {
+            List<ScopeResolver.ChannelTarget> visible = new ArrayList<>();
+            for (ScopeResolver.ChannelTarget target : targets) {
+                if (authorizedChannelIds.contains(target.channelId)) {
+                    visible.add(target);
+                }
+            }
+            targets = visible;
+        }
         List<ChannelTestOutcome> outcomes = new ArrayList<>();
         boolean anyError = false;
 
@@ -313,6 +406,9 @@ public final class MonitorService {
     private static void validate(Monitor monitor, Integer selfId) {
         if (monitor == null) {
             throw new IllegalArgumentException("Monitor body is required");
+        }
+        if (monitor.getName() != null) {
+            monitor.setName(monitor.getName().trim());
         }
         if (isBlank(monitor.getName())) {
             throw new IllegalArgumentException("Monitor name is required");
@@ -637,14 +733,14 @@ public final class MonitorService {
     }
 
     /**
-     * Case-insensitive uniqueness pre-check so a duplicate name yields a
-     * clear 400 instead of a raw constraint violation. Case-insensitive
-     * because two monitors differing only in case are indistinguishable in
-     * every list the UI shows.
+     * Compare both names using the export/import identity rule. Existing
+     * rows may predate name trimming; saving a new monitor must not create
+     * a collision with one of those legacy names.
      */
     private static void requireUniqueName(String name, Integer selfId) {
+        String key = name.trim().toLowerCase(Locale.ROOT);
         for (Monitor other : MonitorRepository.listMonitors(null, null, null, null)) {
-            if (other.getName() != null && other.getName().equalsIgnoreCase(name.trim())
+            if (other.getName() != null && other.getName().trim().toLowerCase(Locale.ROOT).equals(key)
                     && !other.getId().equals(selfId)) {
                 throw new IllegalArgumentException("A monitor named '" + other.getName() + "' already exists");
             }

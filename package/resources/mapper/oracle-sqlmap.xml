@@ -202,6 +202,12 @@
 
     <!-- ========== MONITOR (sentinel_monitor) ========== -->
 
+    <!-- Import holds identity stable through validation and the final write. -->
+    <select id="lockMonitor" parameterType="int" resultType="int" useCache="false" flushCache="true">
+        SELECT id FROM sentinel_monitor WHERE id = #{id}
+        FOR UPDATE
+    </select>
+
     <select id="getMonitor" parameterType="map" resultMap="monitorResult">
         SELECT id, name, description, monitor_type, scope_type, scope_id, enabled, severity,
                config_json, min_consecutive_breaches, suppressed_by_monitor_id, runbook_url,
@@ -362,6 +368,10 @@
                 <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
             </if>
             <if test="monitorId != null">AND monitor_id = #{monitorId}</if>
+            <!-- Repository-generated predicate contains only validated integer IDs.
+                 Literal IDs avoid SQL Server's bind limit; IN groups respect Oracle's limit.
+                 Never populate this parameter from request text. -->
+            <if test="monitorIdPredicate != null">AND ${monitorIdPredicate}</if>
             <!-- sentinel_alert_event has no monitor_type column of its own; join back to the
                  owning monitor row to filter by it. -->
             <if test="monitorType != null">
@@ -413,6 +423,10 @@
                 <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
             </if>
             <if test="monitorId != null">AND monitor_id = #{monitorId}</if>
+            <!-- Repository-generated predicate contains only validated integer IDs.
+                 Literal IDs avoid SQL Server's bind limit; IN groups respect Oracle's limit.
+                 Never populate this parameter from request text. -->
+            <if test="monitorIdPredicate != null">AND ${monitorIdPredicate}</if>
             <if test="monitorType != null">
                 AND EXISTS (SELECT 1 FROM sentinel_monitor m
                             WHERE m.id = sentinel_alert_event.monitor_id AND m.monitor_type = #{monitorType})
@@ -440,6 +454,21 @@
                      OR UPPER(channel_id) LIKE UPPER('%' || #{q} || '%') ESCAPE '!')
             </if>
         </where>
+    </select>
+
+    <select id="listAcknowledgingUserIds" parameterType="map" resultType="Integer">
+        SELECT DISTINCT acknowledged_by
+        FROM sentinel_alert_event
+        WHERE acknowledged_by IS NOT NULL
+        <if test="channelIdIn != null">
+            <choose>
+                <when test="channelIdIn.isEmpty()">AND 1 = 0</when>
+                <otherwise>
+                    AND channel_id IN
+                    <foreach collection="channelIdIn" item="c" open="(" separator="," close=")">#{c}</foreach>
+                </otherwise>
+            </choose>
+        </if>
     </select>
 
     <select id="listRecentAlertEvents" parameterType="map" resultMap="alertEventResult">
@@ -571,6 +600,15 @@
         ORDER BY sample_time
     </select>
 
+    <select id="listActivitySampleTimes" parameterType="map" resultType="java.sql.Timestamp">
+        SELECT DISTINCT sample_time
+        FROM sentinel_channel_activity_sample
+        WHERE channel_id = #{channelId} AND sample_time &gt;= #{from} AND sample_time &lt;= #{to}
+        <if test="after != null">AND sample_time &gt; #{after}</if>
+        ORDER BY sample_time
+        OFFSET 0 ROWS FETCH NEXT #{limit} ROWS ONLY
+    </select>
+
     <select id="sumActivitySamplesForRange" parameterType="map" resultMap="activitySampleSumResult">
         SELECT COALESCE(SUM(received_delta), 0) AS received_sum,
                COALESCE(SUM(sent_delta), 0) AS sent_sum,
@@ -625,6 +663,15 @@
         SELECT MAX(hour_bucket) FROM sentinel_channel_activity_trend
     </select>
 
+    <select id="countActivityTrendForHour" parameterType="map" resultType="int">
+        SELECT COUNT(*) FROM sentinel_channel_activity_trend
+        WHERE channel_id = #{channelId} AND hour_bucket = #{hourBucket}
+    </select>
+
+    <select id="getEarliestActivitySampleTime" resultType="java.sql.Timestamp">
+        SELECT MIN(sample_time) FROM sentinel_channel_activity_sample
+    </select>
+
     <!-- ========== CONNECTOR_STATUS_EVENT (sentinel_connector_status_event) ========== -->
 
     <insert id="insertConnectorStatusEvent" parameterType="map">
@@ -676,6 +723,12 @@
     </delete>
 
     <!-- ========== ACTION (sentinel_action) ========== -->
+
+    <!-- Import holds identity stable through validation and the final write. -->
+    <select id="lockAction" parameterType="int" resultType="int" useCache="false" flushCache="true">
+        SELECT id FROM sentinel_action WHERE id = #{id}
+        FOR UPDATE
+    </select>
 
     <select id="getAction" parameterType="map" resultMap="actionResult">
         SELECT id, name, description, enabled, action_type, condition_json, operation_mode,
@@ -751,6 +804,13 @@
         ORDER BY dispatch_time
     </select>
 
+    <select id="listActionDispatchLogsInRange" parameterType="map" resultMap="actionDispatchLogResult">
+        SELECT id, alert_event_id, action_id, dispatch_time, success, error_message
+        FROM sentinel_action_dispatch_log
+        WHERE dispatch_time &gt;= #{from} AND dispatch_time &lt;= #{to}
+        ORDER BY dispatch_time
+    </select>
+
     <!-- ========== MAINTENANCE_WINDOW (sentinel_maintenance_window) ========== -->
 
     <select id="getMaintenanceWindow" parameterType="map" resultMap="maintenanceWindowResult">
@@ -804,6 +864,10 @@
             created_by = #{created_by,jdbcType=INTEGER},
             created_time = #{created_time}
         WHERE id = #{id}
+    </update>
+
+    <update id="setMaintenanceWindowEnabled" parameterType="map">
+        UPDATE sentinel_maintenance_window SET enabled = #{enabled} WHERE id = #{id}
     </update>
 
     <delete id="deleteMaintenanceWindow" parameterType="map">
@@ -875,6 +939,12 @@
     <select id="listActiveSentinelNodeIds" resultType="string">
         SELECT node_id FROM sentinel_node_lease
         WHERE lease_name LIKE 'sentinel-presence-%'
+          AND expires_time &gt; CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS TIMESTAMP)
+    </select>
+
+    <select id="listHealthyObservationNodeIds" resultType="string">
+        SELECT node_id FROM sentinel_node_lease
+        WHERE lease_name LIKE 'sentinel-observation-%'
           AND expires_time &gt; CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS TIMESTAMP)
     </select>
 

@@ -19,9 +19,9 @@
 import { platform } from '@oie/web-shell';
 import { errorModal } from '@oie/web-ui';
 import {
-    getProblems, listMonitors, getCoreChannelGroups, getCoreTags, errText,
+    getProblems, getDashboardCoverage, errText,
 } from './api.js';
-import { SEVERITY_META, resolveCoverage } from './ui.jsx';
+import { SEVERITY_META, coverageFrom } from './ui.jsx';
 
 const React = platform.React;
 
@@ -254,15 +254,21 @@ const MAX_PROBLEMS = 500;
 
 /* How often coverage (which channels any enabled monitor watches) is re-read,
    as a multiple of POLL_MS. Problems change minute to minute; coverage changes
-   only when somebody edits a monitor, so re-reading three lists every 30s to
-   catch that would be three quarters of this feature's request volume spent on
-   the part that almost never moves. */
+   only when somebody edits a monitor, so re-reading it every 30s to catch
+   that would be half of this feature's request volume spent on the part that
+   almost never moves. */
 const COVERAGE_EVERY_N_POLLS = 10;   // 5 minutes at POLL_MS = 30s
+const PROBLEM_STALE_MS = POLL_MS * 3;
+const COVERAGE_STALE_MS = POLL_MS * (COVERAGE_EVERY_N_POLLS + 2);
 
 const snapshot = {
     byChannel: {},      // channelId -> { count, worst }
     truncated: false,   // more open problems exist than were read
     loaded: false,      // problems have been read at least once
+    problemsUpdatedAt: 0,
+    coverageUpdatedAt: 0,
+    problemsFailed: false,
+    coverageFailed: false,
     coverage: { known: false, coversAll: false, covered: new Set() },
 };
 const listeners = new Set();
@@ -298,26 +304,25 @@ function pollGate() {
 }
 
 /**
- * Re-reads coverage. Failures leave the previous answer in place and, on the
- * very first attempt, leave {@code known} false — which the cell renders as
- * "still resolving" rather than as "not watched". Reporting a channel as
+ * Re-reads coverage. Failures retain the previous answer but mark it stale;
+ * the cell reports unavailable rather than asserting a coverage verdict. Reporting a channel as
  * unmonitored because a lookup failed would be the worst possible error for
  * this column to make: it invites somebody to go create a monitor that already
  * exists, or worse, to trust a green badge that was never earned.
  */
 async function refreshCoverage() {
     try {
-        const [monitors, groups, tags] = await Promise.all([
-            listMonitors(), getCoreChannelGroups(), getCoreTags(),
-        ]);
-        snapshot.coverage = resolveCoverage(monitors, groups, tags);
+        snapshot.coverage = coverageFrom(await getDashboardCoverage());
+        snapshot.coverageUpdatedAt = Date.now();
+        snapshot.coverageFailed = false;
     } catch (e) {
-        // Keep whatever we had; see the Javadoc for why we never downgrade to
-        // "not watched" on a failure.
+        // Retain the data, but never present it as a current health verdict.
+        snapshot.coverageFailed = true;
+        notify();
     }
 }
 
-async function refresh() {
+async function refreshSnapshot() {
     if (!pollGate()) {
         return;
     }
@@ -341,12 +346,24 @@ async function refresh() {
         snapshot.byChannel = byChannel;
         snapshot.truncated = typeof page?.total === 'number' && page.total > items.length;
         snapshot.loaded = true;
+        snapshot.problemsUpdatedAt = Date.now();
+        snapshot.problemsFailed = false;
         notify();
     } catch (e) {
-        // A failed refresh keeps the previous snapshot rather than blanking the
-        // column: stale counts during a blip are far less alarming to read than
-        // every channel suddenly reporting clear.
+        // Keep the last data for recovery without certifying it as current.
+        snapshot.problemsFailed = true;
+        notify();
     }
+}
+
+// Keep coverage and problems in the same serialized refresh. A slow request
+// must finish before another timer/remount can publish a newer snapshot.
+let inFlightRefresh = null;
+function refresh() {
+    if (inFlightRefresh === null) {
+        inFlightRefresh = refreshSnapshot().finally(() => { inFlightRefresh = null; });
+    }
+    return inFlightRefresh;
 }
 
 /** Subscribes a cell to the shared snapshot, starting the poll on the first. */
@@ -397,9 +414,20 @@ function subscribe(fn) {
  */
 function SentinelCell({ channelId }) {
     const [, setTick] = React.useState(0);
-    React.useEffect(() => subscribe(() => setTick((t) => t + 1)), []);
+    React.useEffect(() => subscribeStatus(() => setTick((t) => t + 1)), []);
 
     const entry = snapshot.loaded ? snapshot.byChannel[channelId] : null;
+    const now = Date.now();
+    const problemsStale = snapshot.problemsFailed
+        || (snapshot.loaded && now - snapshot.problemsUpdatedAt > PROBLEM_STALE_MS);
+    const coverageStale = snapshot.coverageFailed
+        || (snapshot.coverage.known && now - snapshot.coverageUpdatedAt > COVERAGE_STALE_MS);
+    // Current incident counts stand on their own; claiming clear or unwatched
+    // additionally requires current coverage. Neither verdict can use stale data.
+    if (problemsStale || (!entry && coverageStale)) {
+        return <span className="sn-host-cell sn-host-idle"
+            title="Sentinel status unavailable — the last refresh failed or is stale; retrying automatically">?</span>;
+    }
 
     if (entry) {
         const meta = SEVERITY_META[entry.worst] || { label: entry.worst || 'Open', color: 'var(--err)' };
@@ -433,6 +461,14 @@ function SentinelCell({ channelId }) {
         return <span className="sn-host-cell sn-host-idle" title="Sentinel is still loading">·</span>;
     }
     if (coversAll || covered.has(channelId)) {
+        // A missing row in an incomplete page cannot establish that the
+        // channel is healthy: its oldest incident may be beyond the cap.
+        if (snapshot.truncated) {
+            return (
+                <span className="sn-host-cell sn-host-idle"
+                    title={`Sentinel status incomplete — only the first ${MAX_PROBLEMS} open problems were loaded`}>?</span>
+            );
+        }
         return (
             <span className="sn-host-cell">
                 <span className="sn-host-badge sn-clear"
@@ -451,6 +487,21 @@ function SentinelCell({ channelId }) {
             </span>
         </span>
     );
+}
+
+// A separate shared clock repaints freshness even when a request is still
+// pending. It makes no network requests and stops with the final cell.
+let freshnessTimer = null;
+function subscribeStatus(fn) {
+    const unsubscribe = subscribe(fn);
+    if (freshnessTimer === null) freshnessTimer = setInterval(notify, POLL_MS);
+    return () => {
+        unsubscribe();
+        if (listeners.size === 0 && freshnessTimer !== null) {
+            clearInterval(freshnessTimer);
+            freshnessTimer = null;
+        }
+    };
 }
 
 /* ---- registration ------------------------------------------------------- */
