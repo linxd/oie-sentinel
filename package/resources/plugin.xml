@@ -3,12 +3,12 @@
 <!-- Published under the terms of the Mozilla Public License 2.0. -->
 
 <pluginMetaData path="sentinel">
-    <name>OIE Sentinel</name>
+    <name>OIE 哨兵</name>
     <author>Chris Gibson</author>
     <pluginVersion>${project.version}</pluginVersion>
     <mirthVersion>${plugin.supported.mc.versions}</mirthVersion>
     <url>https://openintegrationengine.org</url>
-    <description>Zabbix-inspired monitoring and alerting for channel activity: inactivity, low-volume, anomaly-detection and connection-status monitors, with email, channel and SNS alert delivery.</description>
+    <description>借鉴 Zabbix 的通道活动监控与告警：支持无活动、低流量、异常检测和连接状态监控器，并通过邮件、通道和 SNS 投递告警。</description>
 
     <serverClasses>
         <string>org.openintegrationengine.plugins.sentinel.server.SentinelServicePlugin</string>
